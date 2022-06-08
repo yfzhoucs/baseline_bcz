@@ -3,109 +3,9 @@ import torch.nn as nn
 import numpy as np
 import math
 import torch.nn.functional as F
-from torchvision.models import resnet18, resnet50
+from models.film_resnet import resnet18
 import clip
 import contextlib
-
-
-# courtesy: https://github.com/darkstar112358/fast-neural-style/blob/master/neural_style/transformer_net.py
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.downsample = downsample
-
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample:
-            print('downsampled')
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
-        print()
-        return out
-
-
-# https://github.com/rosinality/film-pytorch/blob/master/model.py
-class ResBlock(nn.Module):
-    def __init__(self, filter_size):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(filter_size, filter_size, [1, 1], 1, 1)
-        self.conv2 = nn.Conv2d(filter_size, filter_size, [3, 3], 1, 1, bias=False)
-        self.bn = nn.BatchNorm2d(filter_size, affine=False)
-
-    def forward(self, input, gamma, beta):
-        out = self.conv1(input)
-        resid = F.relu(out)
-        out = self.conv2(resid)
-        out = self.bn(out)
-
-        gamma = gamma.unsqueeze(2).unsqueeze(3)
-        beta = beta.unsqueeze(2).unsqueeze(3)
-
-        out = gamma * out + beta
-
-        out = F.relu(out)
-        out = out + resid
-
-        return out
-
-
-class ImgEncoder(nn.Module):
-    def __init__(self, img_size=224, embedding_size=256, ngf=64, channel_multiplier=4, input_nc=3):
-        super(ImgEncoder, self).__init__()
-        self.layer1 = nn.Sequential(nn.ReflectionPad2d((3,3,3,3)),
-                                    nn.Conv2d(input_nc,ngf,kernel_size=7,stride=1),
-                                    nn.InstanceNorm2d(ngf),
-                                    nn.ReLU(True))
-        
-        self.layer2 = nn.Sequential(nn.Conv2d(ngf,ngf*channel_multiplier//2,kernel_size=3,stride=2,padding=1),
-                                   nn.InstanceNorm2d(ngf*channel_multiplier//2),
-                                   nn.ReLU(True))
-        
-        self.layer3 = nn.Sequential(nn.Conv2d(ngf*channel_multiplier // 2,ngf*channel_multiplier,kernel_size=3,stride=2,padding=1),
-                                   nn.InstanceNorm2d(ngf*channel_multiplier),
-                                   nn.ReLU(True))
-
-        self.layer4 = nn.Sequential(nn.Conv2d(ngf*channel_multiplier,ngf*channel_multiplier,kernel_size=3,stride=2,padding=1),
-                                   nn.InstanceNorm2d(ngf*channel_multiplier),
-                                   nn.ReLU(True))
-
-        self.resblocks = nn.Sequential(ResBlock(ngf*channel_multiplier),
-                                    ResBlock(ngf*channel_multiplier),
-                                    ResBlock(ngf*channel_multiplier))
-
-
-        self.film = nn.Linear(embedding_size, ngf*channel_multiplier * 2 * 3)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-    def forward(self, x, task_embed):
-
-        x = x.permute(0, 3, 1, 2)
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-
-
-        film = self.film(task_embed.squeeze()).chunk(3 * 2, 1)
-
-        for i, resblock in enumerate(self.resblocks):
-            out = resblock(out, film[i * 2], film[i * 2 + 1])
-
-        out = self.avgpool(out).squeeze()
-        return out
 
 
 class Controller(nn.Module):
@@ -301,7 +201,8 @@ class Backbone(nn.Module):
         self.embedding_size = embedding_size
 
         # Visual Pathway
-        self.visual_encoder = ImgEncoder(input_nc=input_nc, embedding_size=embedding_size)
+        self.visual_encoder = resnet18(embedding_size, embedding_size)
+        self.visual_narrower = nn.Linear(512, embedding_size)
 
         # Task Pathway
         self.task_id_encoder, _ = clip.load("ViT-B/32", self.device)
@@ -313,7 +214,9 @@ class Backbone(nn.Module):
 
     def _img_pathway_(self, img, task_embed):
         # Comprehensive Visual Encoder. img_embedding is the square token list
-        img_embedding = self.visual_encoder(img, task_embed)
+        img_embedding = self.visual_encoder(img, task_embed).squeeze()
+        img_embedding = self.visual_narrower(img_embedding)
+        img_embedding = F.relu(img_embedding)
         return img_embedding
 
     def _task_id_pathway_(self, lang):
